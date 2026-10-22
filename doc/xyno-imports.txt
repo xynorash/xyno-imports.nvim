@@ -1,0 +1,161 @@
+*xyno-imports.txt*  Imports without the menu for Rust: auto-import, ranked choice, organize
+
+                            xyno-imports.nvim
+
+==============================================================================
+CONTENTS                                                    *xyno-imports-contents*
+
+  1. Introduction ............................. |xyno-imports|
+  2. Requirements ............................. |xyno-imports-requirements|
+  3. Setup and options ........................ |xyno-imports-setup|
+  4. Commands ................................. |xyno-imports-commands|
+  5. Keymaps .................................. |xyno-imports-keymaps|
+  6. Lua API .................................. |xyno-imports-api|
+  7. How it works ............................. |xyno-imports-how|
+  8. Platforms ................................ |xyno-imports-platforms|
+  9. License and origin ....................... |xyno-imports-license|
+
+==============================================================================
+1. INTRODUCTION                                                    *xyno-imports*
+
+xyno-imports.nvim imports names for Rust on top of rust-analyzer's code
+actions: it imports an unresolved name for you (or after one key), ranks the
+candidates when there are several by what the project already does and
+remembers your choice per project, and organizes imports in one undo step.
+
+The auto-import flow and organize imports are inspired by the import handling
+of the JetBrains IDEs, which I still use. This plugin is independent and not
+affiliated with JetBrains.
+
+==============================================================================
+2. REQUIREMENTS                                            *xyno-imports-requirements*
+
+  - Neovim 0.12+
+  - xyno-rust.nvim (https://github.com/xynorash/xyno-rust.nvim), checked in
+    |xyno_imports.setup()|: without it one error line is shown and the plugin
+    does not start
+  - rust-analyzer started through vim.lsp
+  - `cargo` in $PATH
+  - the tree-sitter `rust` parser
+
+==============================================================================
+3. SETUP AND OPTIONS                                              *xyno-imports-setup*
+
+                                                           *xyno_imports.setup()*
+>lua
+    require("xyno_imports").setup({
+      commands = true, -- :ImportName :ImportForget :ImportOrganize
+      keymaps = false, -- false | true | { import = lhs|false, organize = lhs|false }
+      mode = "ask",    -- "ask" | "single" | "off"
+      config = {},     -- engine tuning
+    })
+<
+Safe to call again.
+
+                                                          *xyno-imports-mode*
+`mode` decides what happens to a name that resolves to nothing, after
+InsertLeave, a save or a paste:
+
+  "ask"     (default, never silent) exactly one `Import X`, or a choice
+            remembered for this project, prompts for one key: <CR> or y
+            accepts, anything else dismisses it for the session
+  "single"  that one import is applied as one undo step, with a one-line note
+  "off"     nothing is scanned
+
+Several candidates are never guessed at: use |:ImportName|.
+`vim.g.xyno_auto_import` set to one of the three values overrides `mode`.
+
+                                                        *xyno-imports-config*
+`config` overrides values of the engine:
+
+  debounce         600    ms between the last change and the scan
+  max_names        8      names looked at per scan
+  retries          5      retries of a "content modified" code action request
+  retry_ms         400
+  organize_rounds  30
+  max_lines        20000  the scan reads the whole buffer per edit: skipped
+                          above this
+  source_wait_ms   4000   how long `resolve()` waits for asynchronous sources
+
+==============================================================================
+4. COMMANDS                                                    *xyno-imports-commands*
+
+                                                                  *:ImportName*
+:ImportName [name]
+    List the candidates for the name (default: under the cursor), best first
+    with the reasons, and import the chosen one. The choice is remembered per
+    project and wins from then on (picker order, "single" auto-import).
+
+                                                                *:ImportForget*
+:ImportForget [name]
+    Forget the remembered choice for the name, or all choices of this project.
+
+                                                              *:ImportOrganize*
+:ImportOrganize
+    rust-analyzer's merge, normalize and remove-unused import assists, applied
+    in one undo step.
+
+==============================================================================
+5. KEYMAPS                                                      *xyno-imports-keymaps*
+
+No global keymap is set. `keymaps = true` maps, buffer-local in Rust files:
+
+  <leader>rI    |:ImportName|
+  <leader>rO    |:ImportOrganize|
+
+A table maps only the actions you list, to the keys you choose (`false` skips
+one): `{ import = "<leader>ci", organize = false }`.
+
+==============================================================================
+6. LUA API                                                          *xyno-imports-api*
+
+`require("xyno_imports.engine")`:
+
+                                                       *xyno_imports.engine*
+mode()                      "ask", "single" or "off"
+resolve({name}, {ctx})      ranked candidates of a name:
+                            `{ name, candidates, best, remembered, choice,
+                            unambiguous, root }`; with `ctx.cb` it is async
+import_name({name}?)        the |:ImportName| flow
+organize()                  the |:ImportOrganize| flow
+trigger({buf})              scan the changed lines of a buffer now
+score({cand}, {facts})      score and reasons of one candidate
+rank({cands}, {facts})      candidates sorted best first
+remembered({root}, {name})  the remembered path
+forget({root}, {name}?)     forget one or all choices; returns the count
+register_source({fn})       add candidates the language server does not know;
+                            `fn(name, ctx)` returns a list of
+                            `{ path, crate, add_crate, apply }`; such
+                            candidates rank last and are never applied
+                            automatically; returns an unregister function
+config                      the tuning table (|xyno-imports-config|)
+
+==============================================================================
+7. HOW IT WORKS                                                      *xyno-imports-how*
+
+After InsertLeave, a save or a paste, the changed lines are scanned for names
+that resolve to nothing (diagnostics plus a tree-sitter scan), debounced.
+rust-analyzer is asked for the code actions at each one. Candidates are scored
+by the `use` lines of the file, its sibling modules and the crate, the context
+of the name, the order of the dependencies and a penalty for a crate that is
+not a dependency yet. Choices are stored per workspace root in
+`stdpath("state")/xyno-imports/imports.json`. An undo of an import is noticed
+so the name does not come back by itself.
+
+==============================================================================
+8. PLATFORMS                                                  *xyno-imports-platforms*
+
+  Linux    tested by the specs of this repository
+  Windows  the guards of the original code are kept; no evidence from this
+           repository; in xynovim's CI the live rust-analyzer flows of
+           neighbouring specs failed or hung there
+  macOS    nothing tested here; one auto-import timing spec timed out in
+           xynovim's CI and is skipped there
+
+==============================================================================
+9. LICENSE AND ORIGIN                                          *xyno-imports-license*
+
+MIT, Copyright (c) 2026 Xynorash. Extracted from xynovim
+(https://github.com/xynorash/xynovim), my Neovim configuration for Rust.
+
+ vim:tw=78:ts=8:ft=help:norl:
