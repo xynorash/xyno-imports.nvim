@@ -46,6 +46,7 @@ The auto-import autocommands start with `setup()`, so load the plugin with `ft =
   keymaps = false, -- false | true | { import = lhs|false, organize = lhs|false }
   mode = "ask",    -- "ask" | "single" | "off"
   config = {},     -- engine tuning, see below
+  weights = {},    -- ranking weights, see below
 }
 ```
 
@@ -61,23 +62,31 @@ Several candidates are never guessed at: use `:ImportName`. `vim.g.xyno_auto_imp
 
 `config` overrides engine values: `debounce = 600` (ms between the last change and the scan), `max_names = 8` (names looked at per scan), `retries = 5` and `retry_ms = 400` (retries of a code action request that answered "content modified"), `organize_rounds = 30`, `max_lines = 20000` (the scan reads the whole buffer per edit and is skipped above this), `source_wait_ms = 4000` (how long `resolve()` waits for asynchronous sources).
 
+`weights` overrides single ranking numbers (`file = 4`, `sibling = 3`, `crate = 2`, `near = 0.5`, `cap = 5`, `derive_macro = 10`, `derive_std = -4`, `error_type = 5`, `return_type = 8`, `trait_pos = 5`, `shadowed_std = -3`, `std_twin = -2`, `dependency = 1`, `not_dependency = -5`; `engine.default_weights` has the list with comments). They are validated: an unknown name, a non-finite or non-number value, `near` outside `[0, 1]` or a `cap` that is not a positive integer refuses the whole table with one warning and the defaults stay. `config` is validated the same way (known keys, positive numbers). Calling `setup()` again replaces the weights (those not given return to the defaults).
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
 | `:ImportName [name]` | List the candidates for the name (default: under the cursor), best first with the reasons, and import the chosen one. The choice is remembered per project and wins from then on. |
 | `:ImportForget [name]` | Forget the remembered choice for the name, or all choices of this project. |
-| `:ImportOrganize` | rust-analyzer's merge, normalize and remove-unused import assists, applied in one undo step. |
+| `:ImportOrganize` | rust-analyzer's merge, normalize and remove-unused import assists, applied in one undo step. Asynchronous: the editor stays usable while rust-analyzer answers. |
 
 ## Lua API
 
-`require("xyno_imports.engine")` has the pure parts and the flow: `mode()`, `score(cand, facts)`, `rank(cands, facts)`, `candidate(path)`, `decide`, `resolve(name, ctx)`, `import_name(name?)`, `organize()`, `trigger(buf)`, `remembered(root, name)`, `remember`, `forget(root, name?)`, `reload_memory()`, `register_source(fn)`, `config` and `weights`. `:help xyno-imports-api` lists the ones meant for other code.
+`require("xyno_imports.engine")` has the pure parts and the flow: `mode()`, `score(cand, facts)`, `rank(cands, facts)`, `candidate(path)`, `decide`, `resolve(name, ctx)`, `import_name(name?)`, `organize(buf?, cb?)`, `import_path(action)`, `use_bindings(stmt)`, `set_weights(t)`, `trigger(buf)`, `remembered(root, name)`, `remember`, `forget(root, name?)`, `reload_memory()`, `register_source(fn)`, `config` and `weights`. `:help xyno-imports-api` lists the ones meant for other code.
 
-`engine.resolve(name, ctx)` returns the ranked candidates of a name (`{ candidates = {...}, best = ... }`). `engine.register_source(fn)` adds candidates the language server does not know, for example a crate that is not a dependency yet; `fn(name, ctx)` returns `{ { path = "rand::Rng", crate = "rand", add_crate = true, apply = function(cb) ... cb(ok, err) end }, ... }`. Such candidates are ranked last and never applied automatically. It returns a function that unregisters the source.
+`engine.resolve(name, ctx)` is asynchronous and needs `ctx.cb`: `cb({ candidates = {...}, best = ... })` gets the ranked candidates of a name. The blocking form (it spun `vim.wait` for up to 30 s) is gone: a call without `cb` returns `nil, message`. `engine.organize(buf?, cb?)` is asynchronous too (`cb(applied)`). `engine.register_source(fn)` adds candidates the language server does not know, for example a crate that is not a dependency yet; `fn(name, ctx)` returns `{ { path = "rand::Rng", crate = "rand", add_crate = true, apply = function(cb) ... cb(ok, err) end }, ... }`. Such candidates are ranked last and never applied automatically. It returns a function that unregisters the source.
 
 ## How it works
 
 After `InsertLeave`, a save or a paste, the changed lines are scanned for names that resolve to nothing (diagnostics of rust-analyzer and the clippy tier, plus a tree-sitter scan), debounced. rust-analyzer is asked for the code actions at each one. Candidates are scored by what the project already does (the same `use` in this file, in sibling modules and in the crate), the context of the name (derive, error type, return type, trait position), the order of the dependencies, and a penalty for a crate that is not a dependency yet; the reasons are shown in the picker. The choices you make are stored per workspace root in `stdpath("state")/xyno-imports/imports.json`. An undo of an import is noticed, so the name does not come back by itself.
+
+## Language of the language server
+
+Import actions are recognised by rust-analyzer's assist id (`data.id`, `auto_import`), then by the shape of the action (a quickfix whose edit adds a `use`), then by the English title `Import \`a::B\``; the path is read from the backticked part of the title or from the edit. Organize assists are recognised by id (`merge_imports`, `normalize_import`, `remove_unused_imports`), by the kind `source.organizeImports`, then by their English titles. Limits: rust-analyzer's own messages are English only as far as I know, so the non-English path is covered by specs with a fake server, not by a localised rust-analyzer; "Remove unnecessary braces" is a diagnostic quickfix without an id, so it is matched by its English title only. An import action whose title has no backticked path and whose edit is lazy (resolved only on apply) is not offered.
+
+`use` parsing: `use a::Foo as Bar` binds `Bar` (so `Foo` is still reported when used unbound), `as _` binds nothing, raw identifiers (`r#type`) parse. Macro-generated `use` items and `use` inside function bodies are not looked at by the text scan.
 
 ## Platforms
 

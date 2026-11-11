@@ -353,7 +353,8 @@ end)
 
 --- A rust-analyzer stand-in: for a range, `answers[name under the range]` is
 --- the list of import paths to offer; the edit inserts the use line at 0:0.
-local function fake_server(buf, answers)
+local function fake_server(buf, answers, shape)
+  shape = shape or {}
   local seen = { requests = 0 }
   local client = {
     id = 4242,
@@ -366,8 +367,9 @@ local function fake_server(buf, answers)
       local result = {}
       for _, path in ipairs(answers[name] or {}) do
         result[#result + 1] = {
-          title = "Import `" .. path .. "`",
+          title = shape.title and shape.title(path) or ("Import `" .. path .. "`"),
           kind = "quickfix",
+          data = shape.data,
           edit = {
             changes = {
               [vim.uri_from_bufnr(buf)] = {
@@ -546,6 +548,21 @@ describe("auto-import flow (fake rust-analyzer)", function()
   end)
 end)
 
+--- resolve() is asynchronous: run it and wait for the callback.
+local function resolve(name, ctx)
+  local got
+  ctx = vim.tbl_extend("force", ctx or {}, {
+    cb = function(r)
+      got = r
+    end,
+  })
+  E.resolve(name, ctx)
+  H.wait_for(function()
+    return got
+  end, 30000, "resolve " .. name)
+  return got
+end
+
 describe("resolve and sources", function()
   it("ranks the server's candidates with the extra sources, remembered ones win", function()
     need_ts()
@@ -556,13 +573,13 @@ describe("resolve and sources", function()
         return { { path = "rand::Rng", crate = "rand", add_crate = true }, { path = "bad path;", crate = "x" } }
       end
     end)
-    local res = E.resolve("Rng", { bufnr = buf })
+    local res = resolve("Rng", { bufnr = buf })
     H.eq({ "x::Rng", "y::Rng", "rand::Rng" }, paths(res.candidates))
     H.eq("x::Rng", res.best.path)
     H.not_ok(res.unambiguous)
     H.ok(res.candidates[3].add_crate)
     E.remember(cm.root(dir .. "/src/main.rs"), "Rng", "y::Rng")
-    res = E.resolve("Rng", { bufnr = buf })
+    res = resolve("Rng", { bufnr = buf })
     H.eq("y::Rng", res.choice.path)
     H.ok(res.unambiguous)
     local got
@@ -577,9 +594,9 @@ describe("resolve and sources", function()
     end, 20000)
     H.eq("y::Rng", got.remembered.path)
     unreg()
-    res = E.resolve("Rng", { bufnr = buf })
+    res = resolve("Rng", { bufnr = buf })
     H.eq(2, #res.candidates)
-    H.eq({}, E.resolve("not a name!", {}).candidates)
+    H.eq({}, resolve("not a name!", {}).candidates)
   end)
 
   it("applies a source candidate through its own apply function", function()
@@ -701,11 +718,11 @@ describe("real rust-analyzer on deps-lab", function()
     lines[4] = "#[derive(Debug, Error)]"
     vim.list_extend(lines, { "", "fn reader() -> std::io::Result<()> {", "    let _e: Error = todo!();", "    Ok(())", "}" })
     set_and_wait(buf, lines, 3, 16, 21, "^Import `thiserror::Error`")
-    local res = E.resolve("Error", { bufnr = buf, pos = { 3, 16 } })
+    local res = resolve("Error", { bufnr = buf, pos = { 3, 16 } })
     H.eq("thiserror::Error", res.best.path, vim.inspect(paths(res.candidates)))
     local row = #lines - 3
     set_and_wait(buf, lines, row, 12, 17, "^Import `std::io::Error`")
-    res = E.resolve("Error", { bufnr = buf, pos = { row, 12 } })
+    res = resolve("Error", { bufnr = buf, pos = { row, 12 } })
     H.eq("std::io::Error", res.best.path, vim.inspect(paths(res.candidates)))
     H.ok(#res.candidates > 3, "ambiguous")
     -- the picker shows the reasons
@@ -747,7 +764,13 @@ describe("real rust-analyzer on deps-lab", function()
       vim.cmd("let &undolevels = &undolevels")
     end)
     local before = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    local n = E.organize(buf)
+    local n
+    E.organize(buf, function(c)
+      n = c
+    end)
+    H.wait_for(function()
+      return n
+    end, 120000, "organize")
     H.ok(n >= 2, "applied " .. n)
     local t = text(buf)
     H.no_match(t, "HashMap", true)
@@ -816,5 +839,164 @@ describe("import engine review fixes", function()
       return plain
     end, 20000, "resolve")
     H.eq(plain, rest)
+  end)
+end)
+
+describe("review: aliases, locale, weights, no blocking", function()
+  it("use_bindings: an alias binds the alias, `as _` binds nothing, raw identifiers parse", function()
+    local function b(stmt)
+      return vim.tbl_map(function(x)
+        return (x.name or "*") .. "=" .. x.path
+      end, E.use_bindings(stmt))
+    end
+    H.eq({ "Bar=a::Foo" }, b("use a::Foo as Bar;"))
+    H.eq({ "c=a::b", "_=a::d", "e=a" }, b("use a::{b as c, d as _, self as e};"))
+    H.eq({ "*=a::*", "x=a::x" }, b("pub use a::{*, x};"))
+    H.eq({ "t=a::r#type" }, b("use a::r#type as t;"))
+    H.eq({ "a::Foo" }, E.flatten_use("use a::Foo as Bar;"))
+  end)
+
+  it("scan_syntax: `use a::Foo as Bar` makes Bar known, not Foo", function()
+    need_ts()
+    local buf = rust_buffer({ "use a::Foo as Bar;", "use b::Baz as _;", "fn f(_: Bar, _: Foo, _: Baz) {}" })
+    H.eq({ "Foo", "Baz" }, names(E.scan_syntax(buf, 0, 2)))
+  end)
+
+  it("import_path: by assist id and edit shape in any language, English title as fallback", function()
+    local edit = { changes = { ["file:///x.rs"] = { { range = {}, newText = "use std::io::Error;\n" } } } }
+    H.eq("std::io::Error", E.import_path({ title = "Importar `std::io::Error`", kind = "quickfix", data = { id = "auto_import:QuickFix:0:" } }))
+    H.eq("std::io::Error", E.import_path({ title = "\xe5\xaf\xbc\xe5\x85\xa5 `std::io::Error`", kind = "quickfix", data = { id = "auto_import:QuickFix:1:" } }))
+    H.eq("std::io::Error", E.import_path({ title = "Importer `std::io::Error`", kind = "quickfix", edit = edit }))
+    H.eq("std::io::Error", E.import_path({ title = "Import `std::io::Error`", kind = "quickfix" }))
+    H.eq("std::fmt::Result", E.import_path({ title = "Import `std::fmt::Result as FmtResult`", kind = "quickfix" }))
+    H.eq("a::B", E.import_path({ title = "x", kind = "quickfix", data = { id = "auto_import:QuickFix:0:" }, edit = { changes = { f = { { newText = "use a::B;\n" } } } } }))
+    H.eq(nil, E.import_path({ title = "Merge imports", kind = "refactor.rewrite", data = { id = "merge_imports:RefactorRewrite:0:" } }))
+    H.eq(nil, E.import_path({ title = "Import `x::Y`", kind = "quickfix", data = { id = "qualify_path:QuickFix:0:" } }))
+    H.eq(nil, E.import_path({ title = "Importer `a::B`", kind = "quickfix", edit = { changes = { f = { { newText = "use c::D;\n" } } } } }))
+  end)
+
+  it("candidates_at finds the imports of a server that answers in another language", function()
+    need_ts()
+    local buf = rust_buffer({ "fn f() {", "    let _r = Rng::new();", "}" })
+    fake_server(buf, { Rng = { "rand::Rng" } }, {
+      title = function(p)
+        return "Importar `" .. p .. "`"
+      end,
+      data = { id = "auto_import:QuickFix:0:" },
+    })
+    local got
+    E.candidates_at(buf, { row = 1, col = 13, end_col = 16 }, function(c)
+      got = c
+    end)
+    H.wait_for(function()
+      return got
+    end, 20000, "candidates")
+    H.eq({ "rand::Rng" }, paths(got))
+  end)
+
+  it("organize_match by assist id in any language", function()
+    need_ts()
+    local buf = rust_buffer({ "use std::io::Read;", "use std::io::Write;", "fn f(_: &mut dyn Read, _: &mut dyn Write) {}" })
+    local calls = 0
+    local client = {
+      id = 4243,
+      name = "rust-analyzer",
+      offset_encoding = "utf-16",
+      request = function(_, _, _, cb)
+        calls = calls + 1
+        vim.schedule(function()
+          cb(nil, calls == 1 and { { title = "Fusionar importaciones", kind = "refactor.rewrite", data = { id = "merge_imports:RefactorRewrite:0:" }, edit = {
+            changes = { [vim.uri_from_bufnr(buf)] = { { range = { start = { line = 0, character = 0 }, ["end"] = { line = 1, character = 19 } }, newText = "use std::io::{Read, Write};\n" } } },
+          } } } or {})
+        end)
+      end,
+    }
+    stub(ca, "clients", function()
+      return { client }
+    end)
+    local n
+    E.organize(buf, function(c)
+      n = c
+    end)
+    H.wait_for(function()
+      return n
+    end, 20000, "organize")
+    H.eq(1, n)
+    H.match(table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"), "use std::io::{Read, Write};", true)
+  end)
+
+  it("resolve and organize never call vim.wait", function()
+    need_ts()
+    local buf = rust_buffer({ "fn f() {", "    let _r = Rng::new();", "}" })
+    fake_server(buf, { Rng = { "x::Rng" } })
+    local waited = 0
+    stub(vim, "wait", function()
+      waited = waited + 1
+      return true
+    end)
+    local got, done
+    local r1, err = E.resolve("Rng", { bufnr = buf })
+    H.eq(nil, r1)
+    H.match(err, "needs ctx.cb", true)
+    E.resolve("Rng", { bufnr = buf, cb = function(r) got = r end })
+    E.organize(buf, function() done = true end)
+    local t0 = vim.uv.hrtime()
+    -- the helper's own waiting is a loop of vim.wait: poll without it
+    while not (got and done) and (vim.uv.hrtime() - t0) / 1e6 < 20000 do
+      vim.cmd("sleep 20m")
+    end
+    H.ok(got and done, "both finished")
+    H.eq(0, waited)
+  end)
+
+  it("weights: validated, applied to the score, reset by setup", function()
+    local c = E.candidate("std::io::Error")
+    local facts = { ctx = { error = true } }
+    local base = E.score(c, facts)
+    H.ok(E.set_weights({ error_type = 9 }))
+    H.eq(base + 4, E.score(c, facts))
+    local bad = {
+      { { nope = 1 }, "unknown weight" },
+      { { file = "4" }, "finite number" },
+      { { file = 0 / 0 }, "finite number" },
+      { { file = math.huge }, "finite number" },
+      { { near = 2 }, "within" },
+      { { cap = 0.5 }, "positive integer" },
+    }
+    for _, b in ipairs(bad) do
+      local ok, errs = E.set_weights(b[1])
+      H.eq(false, ok)
+      H.match(errs[1], b[2], true)
+      H.eq(9, E.weights.error_type, "a refused set changes nothing")
+    end
+    H.ok(E.set_weights({}))
+    H.eq(base, E.score(c, facts), "unset weights return to the defaults")
+    local cap = H.capture_notify()
+    require("xyno_imports").setup({ weights = { file = 7, bogus = 1 }, config = { debounce = -1, zzz = 1 } })
+    H.eq(4, E.weights.file, "an invalid weights table is refused as a whole")
+    local msg = cap.list[#cap.list].msg
+    H.match(msg, "unknown weight `bogus`", true)
+    H.match(msg, "config `debounce`", true)
+    H.match(msg, "unknown config key `zzz`", true)
+    require("xyno_imports").setup({ weights = { file = 7 } })
+    H.eq(7, E.weights.file)
+    require("xyno_imports").setup({})
+    H.eq(4, E.weights.file)
+  end)
+
+  it("health check runs", function()
+    local lines = {}
+    local orig = vim.health
+    vim.health = setmetatable({
+      start = function(m) lines[#lines + 1] = m end,
+      ok = function(m) lines[#lines + 1] = m end,
+      info = function(m) lines[#lines + 1] = m end,
+      warn = function(m) lines[#lines + 1] = m end,
+      error = function(m) lines[#lines + 1] = m end,
+    }, {})
+    local ok, err = pcall(require("xyno_imports.health").check)
+    vim.health = orig
+    H.ok(ok, err)
+    H.ok(#lines >= 6, "reports")
   end)
 end)

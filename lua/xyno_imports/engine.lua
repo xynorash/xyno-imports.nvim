@@ -26,6 +26,16 @@ local cm = require("xyno_rust.crate_meta")
 
 local M = {}
 
+--- Workspace root of a file for the hot paths (scans, undo guard, commands): the cached
+--- cargo answer or the file-system one, never waiting for cargo (xyno-rust's root() would
+--- block up to cargo.config.wait_ms on a cold cache). resolve() asks cargo asynchronously.
+local function root_of(file)
+  if file == "" then
+    return nil
+  end
+  return require("xyno_rust.rust_context").root(file, { nowait = true })
+end
+
 M.config = {
   debounce = 600, -- ms between the last change and the scan
   max_names = 8, -- names looked at per scan
@@ -195,7 +205,7 @@ local function tokenize(s)
       toks[#toks + 1] = c
       i = i + 1
     else
-      local id = s:match("^[%w_]+", i)
+      local id = s:match("^r#[%w_]+", i) or s:match("^[%w_]+", i)
       if not id then
         i = i + 1
       else
@@ -207,8 +217,12 @@ local function tokenize(s)
   return toks
 end
 
-local function parse_tree(toks, i, prefix, out)
+--- `out` collects the imported paths; `binds` (optional) the bindings the statement
+--- introduces: { path, name } with `name` the alias (`as x`), the last segment
+--- otherwise, "_" for `as _` (binds nothing) and nil for a glob.
+local function parse_tree(toks, i, prefix, out, binds)
   local segs = {}
+  local alias
   while true do
     local t = toks[i]
     if t == "::" then
@@ -218,7 +232,7 @@ local function parse_tree(toks, i, prefix, out)
       local base = join(prefix, segs)
       while toks[i] and toks[i] ~= "}" do
         local before = i
-        i = parse_tree(toks, i, base, out)
+        i = parse_tree(toks, i, base, out, binds)
         if toks[i] == "," then
           i = i + 1
         end
@@ -228,12 +242,17 @@ local function parse_tree(toks, i, prefix, out)
       end
       return i + 1
     elseif t == "*" then
-      out[#out + 1] = table.concat(join(prefix, segs), "::") .. "::*"
+      local g = table.concat(join(prefix, segs), "::") .. "::*"
+      out[#out + 1] = g
+      if binds then
+        binds[#binds + 1] = { path = g }
+      end
       return i + 1
-    elseif t and t:match("^[%w_]+$") then
+    elseif t and t:match("^[%w_#]+$") then
       segs[#segs + 1] = t
       i = i + 1
       if toks[i] == "as" then
+        alias = toks[i + 1]
         i = i + 2
         break
       elseif toks[i] ~= "::" then
@@ -247,28 +266,58 @@ local function parse_tree(toks, i, prefix, out)
     if segs[#segs] == "self" and (#segs > 1 or #prefix > 0) then
       segs[#segs] = nil
     end
-    out[#out + 1] = table.concat(join(prefix, segs), "::")
+    local path = table.concat(join(prefix, segs), "::")
+    out[#out + 1] = path
+    if binds then
+      local last = join(prefix, segs)
+      binds[#binds + 1] = { path = path, name = alias or last[#last], alias = alias ~= nil or nil }
+    end
   end
   return i
+end
+
+local function strip_use(stmt)
+  local body = strip_comments(stmt)
+  return (body:gsub("^%s*pub%s*%b()", ""):gsub("^%s*pub%s+", ""):gsub("^%s*use%s+", ""):gsub("%s*;%s*$", ""))
 end
 
 --- The paths a `use` statement imports, braces expanded, aliases dropped:
 --- "use a::{b, c::{self, d as e}};" -> a::b, a::c, a::c::d
 function M.flatten_use(stmt)
-  local body = strip_comments(stmt)
-  body = body:gsub("^%s*pub%s*%b()", ""):gsub("^%s*pub%s+", ""):gsub("^%s*use%s+", ""):gsub("%s*;%s*$", "")
   local out = {}
-  parse_tree(tokenize(body), 1, {}, out)
+  parse_tree(tokenize(strip_use(stmt)), 1, {}, out)
   return out
 end
+
+--- The names a `use` statement binds: { { path, name, alias } }. `use a::b as c`
+--- binds `c` (not `b`), `as _` binds nothing, a glob has no name.
+function M.use_bindings(stmt)
+  local out, binds = {}, {}
+  parse_tree(tokenize(strip_use(stmt)), 1, {}, out, binds)
+  return binds
+end
+
+local USE_PATTERNS = { "\n[ \t]*(use%s+[^;]*;)", "\n[ \t]*(pub%s+use%s+[^;]*;)", "\n[ \t]*(pub%s*%b()%s*use%s+[^;]*;)" }
 
 --- All paths imported by the `use` statements of a text.
 function M.use_paths(text)
   local out = {}
   local t = "\n" .. strip_comments(text)
-  for _, pat in ipairs({ "\n[ \t]*(use%s+[^;]*;)", "\n[ \t]*(pub%s+use%s+[^;]*;)", "\n[ \t]*(pub%s*%b()%s*use%s+[^;]*;)" }) do
+  for _, pat in ipairs(USE_PATTERNS) do
     for stmt in t:gmatch(pat) do
       vim.list_extend(out, M.flatten_use(stmt))
+    end
+  end
+  return out
+end
+
+--- All bindings introduced by the `use` statements of a text (see use_bindings).
+function M.use_binding_list(text)
+  local out = {}
+  local t = "\n" .. strip_comments(text)
+  for _, pat in ipairs(USE_PATTERNS) do
+    for stmt in t:gmatch(pat) do
+      vim.list_extend(out, M.use_bindings(stmt))
     end
   end
   return out
@@ -308,7 +357,60 @@ local STD = { std = true, core = true, alloc = true }
 
 -- ----------------------------------------------------------------- scoring
 
-M.weights = { file = 4, sibling = 3, crate = 2, near = 0.5, cap = 5 }
+-- Every number the ranking uses. setup{ weights = {...} } overrides single keys
+-- (validated, see M.set_weights); M.weights is the live table.
+M.default_weights = {
+  file = 4, -- per `use <path>` in this file
+  sibling = 3, -- per `use <path>` in the module siblings
+  crate = 2, -- per `use <path>` elsewhere in the crate
+  near = 0.5, -- factor for a use from the same parent module (not the same item)
+  cap = 5, -- uses counted per tier at most
+  derive_macro = 10, -- derive context: candidate of a proc-macro crate
+  derive_std = -4, -- derive context: a std item
+  error_type = 5, -- error context: `...Error` name
+  return_type = 8, -- matches the module of the enclosing fn's Result
+  trait_pos = 5, -- a trait where a trait is expected
+  shadowed_std = -3, -- a dependency offers the same name as a std item
+  std_twin = -2, -- core/alloc item that std offers too
+  dependency = 1, -- divided by the dependency position (dependency #1 gets all of it)
+  not_dependency = -5, -- the crate is not a dependency yet
+}
+M.weights = vim.deepcopy(M.default_weights)
+
+--- Validate and apply weight overrides: `w` is { name = number }. Unknown names, non-finite
+--- or non-number values are refused (nothing is applied then). near must be within [0, 1],
+--- cap must be a positive integer. Resets the weights not mentioned to their defaults.
+--- Returns true, or false + a list of problems.
+function M.set_weights(w)
+  local errs = {}
+  local merged = vim.deepcopy(M.default_weights)
+  if w ~= nil and type(w) ~= "table" then
+    return false, { "weights must be a table" }
+  end
+  for k, v in pairs(w or {}) do
+    if M.default_weights[k] == nil then
+      errs[#errs + 1] = ("unknown weight `%s`"):format(tostring(k))
+    elseif type(v) ~= "number" or v ~= v or v == math.huge or v == -math.huge then
+      errs[#errs + 1] = ("weight `%s` must be a finite number, got %s"):format(k, vim.inspect(v))
+    elseif k == "near" and (v < 0 or v > 1) then
+      errs[#errs + 1] = "weight `near` must be within [0, 1]"
+    elseif k == "cap" and (v < 1 or v % 1 ~= 0) then
+      errs[#errs + 1] = "weight `cap` must be a positive integer"
+    else
+      merged[k] = v
+    end
+  end
+  if #errs > 0 then
+    return false, errs
+  end
+  for k in pairs(M.weights) do
+    M.weights[k] = nil
+  end
+  for k, v in pairs(merged) do
+    M.weights[k] = v
+  end
+  return true
+end
 
 --- Return-type hint of a function: { error = bool (it returns a Result),
 --- mod = the module/crate the Result or its error comes from }.
@@ -369,37 +471,37 @@ function M.score(cand, facts)
   local is_std = STD[cand.crate] or false
   if ctx.derive then
     if facts.proc_macro and facts.proc_macro[cand.crate] then
-      add(10, "derive macro of a proc-macro crate")
+      add(W.derive_macro, "derive macro of a proc-macro crate")
     elseif is_std then
-      add(-4, "std items are not derive macros")
+      add(W.derive_std, "std items are not derive macros")
     end
   end
   if ctx.error and cand.name:match("Error$") then
-    add(5, "error type in an error context")
+    add(W.error_type, "error type in an error context")
   end
   if ctx.ret and ctx.ret.mod then
     local parent_last = cand.parent:match("([^:]+)$")
     if parent_last == ctx.ret.mod or cand.crate == ctx.ret.mod then
-      add(8, ("matches the return type `%s::Result`"):format(ctx.ret.mod))
+      add(W.return_type, ("matches the return type `%s::Result`"):format(ctx.ret.mod))
     end
   end
   if ctx.trait_pos and cand.kind == "trait" then
-    add(5, "a trait where a trait is expected")
+    add(W.trait_pos, "a trait where a trait is expected")
   end
   if facts.shadowed and facts.shadowed[cand.name] and is_std then
-    add(-3, "a dependency offers the same name")
+    add(W.shadowed_std, "a dependency offers the same name")
   end
   if cand.crate == "core" or cand.crate == "alloc" then
     if facts.std_twin and facts.std_twin[cand.name] then
-      add(-2, "std offers it too")
+      add(W.std_twin, "std offers it too")
     end
   end
   local idx = facts.dep_index and facts.dep_index[cand.crate]
   if idx then
-    add(math.floor(10 / idx + 0.5) / 10, ("dependency #%d"):format(idx))
+    add(math.floor(W.dependency / idx * 10 + 0.5) / 10, ("dependency #%d"):format(idx))
   end
   if cand.add_crate then
-    add(-5, "not a dependency yet")
+    add(W.not_dependency, "not a dependency yet")
   end
   return score, why
 end
@@ -642,9 +744,11 @@ function M.scan_syntax(buf, from, to, opts)
   else
     local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
     known = declared_names(text)
-    for _, p in ipairs(M.use_paths(text)) do
-      known[p:match("([%w_]+)$") or p] = true
-      -- a glob import may bring anything: nothing is "unresolved" by syntax then
+    for _, b in ipairs(M.use_binding_list(text)) do
+      -- `use a::B as C` binds C, not B; `as _` binds nothing
+      if b.name and b.name ~= "_" then
+        known[b.name] = true
+      end
     end
     for _, gq in ipairs(generic_queries()) do
       for _, node in gq:iter_captures(root, buf, 0, -1) do
@@ -654,7 +758,7 @@ function M.scan_syntax(buf, from, to, opts)
     known_memo[buf] = { tick = tick, known = known }
   end
   local file = vim.api.nvim_buf_get_name(buf)
-  local croot = file ~= "" and cm.root(file) or nil
+  local croot = root_of(file)
   local out, seen = {}, {}
   local skip = { use_declaration = true, macro_definition = true }
   local q = scan_query()
@@ -849,14 +953,14 @@ end
 
 --- Everything the scoring wants to know about a position, gathered async:
 --- cb(facts) (never fails: what cannot be read is left out).
-function M.facts_async(buf, pos, cands, cb)
+function M.facts_async(buf, pos, cands, cb, root)
   local file = vim.api.nvim_buf_get_name(buf)
   local facts = { uses = { file = {}, sibling = {}, crate = {} }, ctx = {}, dep_index = {}, proc_macro = {} }
   if pos then
     facts.ctx = M.context_at(buf, pos[1], pos[2])
   end
   facts.uses.file = M.use_paths(table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
-  local root = file ~= "" and cm.root(file) or nil
+  root = root or root_of(file)
   local function with_meta(meta)
     if meta then
       local member = file ~= "" and cm.member_of(meta, file) or nil
@@ -995,6 +1099,79 @@ local function busy(errs)
   return false
 end
 
+-- rust-analyzer puts the id of the assist in `data.id` ("auto_import:QuickFix:3:"), which does not
+-- depend on the language of the title. Detection order: that id, then the shape of the
+-- action (a quickfix whose edit inserts a `use`), then the English title.
+local function assist_id(a)
+  local id = type(a.data) == "table" and a.data.id or nil
+  return type(id) == "string" and id:match("^([%w_]+)") or nil
+end
+
+--- The `use` paths an edit inserts or rewrites (workspace edit: changes or documentChanges).
+local function edit_use_paths(edit)
+  local out = {}
+  if type(edit) ~= "table" then
+    return out
+  end
+  local function scan(edits)
+    for _, e in ipairs(edits or {}) do
+      if type(e.newText) == "string" then
+        for stmt in ("\n" .. e.newText):gmatch("\n[ \t]*(use%s+[^;]*;)") do
+          vim.list_extend(out, M.flatten_use(stmt))
+        end
+      end
+    end
+  end
+  for _, edits in pairs(edit.changes or {}) do
+    scan(edits)
+  end
+  for _, dc in ipairs(edit.documentChanges or {}) do
+    scan(dc.edits)
+  end
+  return out
+end
+
+--- The path an import code action brings in, or nil when the action is not an import.
+--- Matches by the assist id (data.id), then by the edit shape, then by the English title
+--- "Import `a::B`"; the path is taken from the backticked part of the title (any language)
+--- or, when the title has none, from the single path the edit inserts.
+function M.import_path(a)
+  if type(a) ~= "table" then
+    return nil
+  end
+  local viaid = assist_id(a) == "auto_import"
+  local title = type(a.title) == "string" and a.title or ""
+  local ticked = title:match("`([^`]+)`")
+  if ticked then
+    ticked = ticked:gsub("%s+as%s+.*$", "")
+    if not ticked:match("^[%w_]+[%w_:]*$") then
+      ticked = nil
+    end
+  end
+  if viaid then
+    if ticked then
+      return ticked
+    end
+    local ps = edit_use_paths(a.edit)
+    return #ps == 1 and ps[1]:match("^[%w_:]+$") and ps[1] or nil
+  end
+  if assist_id(a) then
+    return nil -- some other assist (its id is known and is not an import)
+  end
+  local english = M.parse_title(title)
+  if english then
+    return english
+  end
+  -- shape: a quickfix whose edit adds exactly one `use`; the title only names the path
+  if a.kind and tostring(a.kind):match("^quickfix") and ticked then
+    local ps = edit_use_paths(a.edit)
+    if #ps == 1 and (ps[1] == ticked or ps[1]:match("::" .. ticked:gsub("%p", "%%%0") .. "$") or ticked:match("::" .. ps[1]:gsub("%p", "%%%0") .. "$")) then
+      return ticked
+    end
+  end
+  return nil
+end
+
 --- Import candidates rust-analyzer offers for the name at `pos`
 --- ({ row, col, end_col }): cb(list of candidates, err).
 function M.candidates_at(buf, pos, cb, diags, tries)
@@ -1010,7 +1187,7 @@ function M.candidates_at(buf, pos, cb, diags, tries)
     end
     local out, have = {}, {}
     for _, a in ipairs(list) do
-      local path = M.parse_title(a.title)
+      local path = M.import_path(a)
       if path and not have[path] then
         have[path] = true
         out[#out + 1] = make_candidate(path, { action = a })
@@ -1049,22 +1226,24 @@ end
 --- best, remembered = the candidate remembered for this project (if offered),
 --- choice = remembered or the only candidate (what "single" mode would take),
 --- unambiguous = bool, root }.
---- With ctx.cb the call is async (cb(result)); without it, it blocks (up to 30 s).
+--- Asynchronous: the result goes to ctx.cb(result). There is no blocking form (it used to
+--- spin vim.wait for up to 30 s, which froze the UI); a call without ctx.cb returns nil
+--- and a message and does nothing.
 function M.resolve(name, ctx)
   ctx = ctx or {}
+  if type(ctx.cb) ~= "function" then
+    return nil, "xyno_imports.engine.resolve needs ctx.cb (it is asynchronous)"
+  end
   if type(name) ~= "string" or not name:match("^[%w_]+$") then
     local r = { name = name, candidates = {}, unambiguous = false }
-    if ctx.cb then
-      vim.schedule(function()
-        ctx.cb(r)
-      end)
-      return
-    end
-    return r
+    vim.schedule(function()
+      ctx.cb(r)
+    end)
+    return
   end
   local buf = ctx.bufnr and ctx.bufnr ~= 0 and ctx.bufnr or vim.api.nvim_get_current_buf()
   local file = vim.api.nvim_buf_get_name(buf)
-  local root = file ~= "" and cm.root(file) or nil
+  local root
   local pos = ctx.pos and { row = ctx.pos[1], col = ctx.pos[2], end_col = ctx.pos[2] + #name } or word_range(buf, name)
 
   local rank_and_report
@@ -1109,33 +1288,32 @@ function M.resolve(name, ctx)
         unambiguous = choice ~= nil,
         facts = facts,
       }
-      if ctx.cb then
-        ctx.cb(result)
-      else
-        ctx._done, ctx._result = true, result
-      end
-    end)
+      ctx.cb(result)
+    end, root)
   end
 
-  if pos then
-    local diags = {}
-    for _, d in ipairs(vim.diagnostic.get(buf, { lnum = pos.row })) do
-      diags[#diags + 1] = d
+  local function start()
+    if pos then
+      local diags = {}
+      for _, d in ipairs(vim.diagnostic.get(buf, { lnum = pos.row })) do
+        diags[#diags + 1] = d
+      end
+      M.candidates_at(buf, pos, function(cands)
+        finish(cands)
+      end, diags)
+    else
+      vim.schedule(function()
+        finish({})
+      end)
     end
-    M.candidates_at(buf, pos, function(cands)
-      finish(cands)
-    end, diags)
-  else
-    vim.schedule(function()
-      finish({})
-    end)
   end
-  if not ctx.cb then
-    vim.wait(30000, function()
-      return ctx._done
-    end, 10)
-    return ctx._result
+  if file == "" then
+    return start()
   end
+  require("xyno_rust.rust_context").root_async(file, function(r)
+    root = r
+    start()
+  end)
 end
 
 -- ------------------------------------------------------------- applying
@@ -1205,7 +1383,7 @@ function M.run(buf, from, to, opts)
     return opts.done and opts.done(0)
   end
   local file = vim.api.nvim_buf_get_name(buf)
-  local root = file ~= "" and cm.root(file) or nil
+  local root = root_of(file)
   local nrows = vim.api.nvim_buf_line_count(buf)
   from, to = math.max(0, math.min(from, nrows - 1)), math.max(0, math.min(to, nrows - 1))
   local function go(meta)
@@ -1390,18 +1568,24 @@ end
 
 -- -------------------------------------------------------------- organize
 
--- Titles measured on rust-analyzer 1.99: "Merge imports" and "Normalize
--- import" (refactor.rewrite, offered at a cursor inside a `use`, not for a
--- selection of it), "Remove unnecessary braces" and "Remove all unused imports"
--- (quickfix, the latter for any range that holds an unused import).
+-- What counts as an organize assist. rust-analyzer's assist ids (data.id, independent of the
+-- language of the title) first, the kind source.organizeImports, then the English titles
+-- measured on rust-analyzer 1.99 ("Merge imports" and "Normalize import" are refactor.rewrite,
+-- offered at a cursor inside a `use`, not for a selection of it; "Remove unnecessary braces"
+-- and "Remove all unused imports" are quickfixes).
+local ORGANIZE_IDS = { merge_imports = true, normalize_import = true, remove_unused_imports = true, unnecessary_braces_in_use_statement = true }
 local ORGANIZE = { "^Merge imports", "^Normalize import", "^Remove unnecessary braces", "^Remove all unused imports" }
 
 local function organize_match(a)
-  if a.kind:match("^source%.organizeImports") then
+  if tostring(a.kind or ""):match("^source%.organizeImports") then
     return true
   end
+  local id = assist_id(a)
+  if id then
+    return ORGANIZE_IDS[id] == true
+  end
   for _, p in ipairs(ORGANIZE) do
-    if a.title:find(p) then
+    if (a.title or ""):find(p) then
       return true
     end
   end
@@ -1428,56 +1612,98 @@ local function organize_ranges(buf)
   return out
 end
 
---- Merge / normalize / remove unused imports with rust-analyzer's assists,
---- in ONE undo step. Blocking (up to ~a minute on a cold server). Returns the
---- number of assists applied.
-function M.organize(buf)
-  buf = buf or vim.api.nvim_get_current_buf()
+--- Merge / normalize / remove unused imports with rust-analyzer's assists, in ONE undo
+--- step. Asynchronous (it can take a while on a cold server, the editor stays usable);
+--- the result is reported with a notification and as cb(applied) when given:
+--- M.organize(buf?, cb?) or M.organize(cb).
+function M.organize(buf, cb)
+  if type(buf) == "function" then
+    buf, cb = nil, buf
+  end
+  buf = (buf == nil or buf == 0) and vim.api.nvim_get_current_buf() or buf
+  cb = cb or function() end
   if not vim.bo[buf].modifiable then
     notify("buffer is not modifiable", vim.log.levels.WARN)
-    return 0
+    return cb(0)
   end
   if #ca.clients(buf) == 0 then
     notify("rust-analyzer is not attached", vim.log.levels.WARN)
-    return 0
+    return cb(0)
   end
-  local applied, skipped, settled = 0, {}, false
-  for _ = 1, M.config.organize_rounds do
-    local did = false
-    for _, r in ipairs(organize_ranges(buf)) do
-      local list = ca.request_wait(buf, r, { diagnostics = vim.diagnostic.get(buf, { lnum = r.start[1] }), only = { "quickfix", "refactor.rewrite", "source.organizeImports" }, timeout = 8000 })
-      for _, a in ipairs(vim.tbl_filter(organize_match, list)) do
-        local key = a.title .. "\0" .. (r.text or "")
-        if not skipped[key] then
-          local before = vim.api.nvim_buf_get_changedtick(buf)
-          local ok = ca.apply(a, { join = applied > 0 })
-          if not ok or vim.api.nvim_buf_get_changedtick(buf) == before then
-            skipped[key] = true
-          else
-            applied = applied + 1
-            did = true
-            break
-          end
+  local applied, skipped, settled, rounds, finished = 0, {}, false, 0, false
+  local function finish(msg, level)
+    if finished then
+      return
+    end
+    finished = true
+    notify(msg or (applied > 0 and ("organized imports (%d change%s)"):format(applied, applied == 1 and "" or "s") or "imports already organized"), level)
+    cb(applied)
+  end
+  local max_tries = math.max(1, math.ceil(8000 / math.max(M.config.retry_ms, 1)))
+  local ask, round
+
+  -- one request for a range; "content modified" is retried up to ~8 s
+  function ask(r, tries, k)
+    if not vim.api.nvim_buf_is_valid(buf) then
+      return finish("buffer is gone", vim.log.levels.WARN)
+    end
+    local only = { "quickfix", "refactor.rewrite", "source.organizeImports" }
+    ca.request(buf, r, { diagnostics = vim.diagnostic.get(buf, { lnum = r.start[1] }), only = only }, function(list, errs)
+      if busy(errs) and tries < max_tries then
+        return vim.defer_fn(function()
+          ask(r, tries + 1, k)
+        end, M.config.retry_ms)
+      end
+      k(list or {})
+    end)
+  end
+
+  function round()
+    rounds = rounds + 1
+    if rounds > M.config.organize_rounds or not vim.api.nvim_buf_is_valid(buf) then
+      return finish()
+    end
+    local ranges = organize_ranges(buf)
+    local function try_range(i)
+      if i > #ranges then
+        -- rust-analyzer may still be re-analysing after our last edit: look once more
+        -- before concluding that nothing is left
+        if settled then
+          return finish()
         end
+        settled = true
+        return vim.defer_fn(round, 800)
       end
-      if did then
-        break -- the ranges moved: look again from the top
-      end
+      local r = ranges[i]
+      ask(r, 0, function(list)
+        local matches = vim.tbl_filter(organize_match, list)
+        local function try_action(j)
+          local a = matches[j]
+          if not a then
+            return try_range(i + 1)
+          end
+          local key = tostring(a.title) .. "\0" .. (r.text or "")
+          if skipped[key] then
+            return try_action(j + 1)
+          end
+          local before = vim.api.nvim_buf_get_changedtick(buf)
+          ca.apply_async(a, function(ok)
+            if not ok or vim.api.nvim_buf_get_changedtick(buf) == before then
+              skipped[key] = true
+              return try_action(j + 1)
+            end
+            applied = applied + 1
+            settled = false
+            round() -- the ranges moved: look again from the top
+          end, { join = applied > 0 })
+        end
+        try_action(1)
+      end)
     end
-    if not did then
-      -- rust-analyzer may still be re-analysing after our last edit: look
-      -- once more before concluding that nothing is left
-      if settled then
-        break
-      end
-      settled = true
-      vim.wait(800)
-    else
-      settled = false
-    end
+    try_range(1)
   end
-  notify(applied > 0 and ("organized imports (%d change%s)"):format(applied, applied == 1 and "" or "s") or "imports already organized")
-  return applied
+
+  round()
 end
 
 -- ------------------------------------------------------------- triggers
@@ -1582,7 +1808,7 @@ local function undo_guard(buf)
   local li = last_import[buf]
   if li and seq < li.seq then
     local file = vim.api.nvim_buf_get_name(buf)
-    local root = file ~= "" and cm.root(file) or nil
+    local root = root_of(file)
     dismissed[dkey(root, li.name, "*")] = true
     last_import[buf] = nil
   end
@@ -1621,7 +1847,7 @@ local function define_commands()
   end, { nargs = "?", desc = "Import a name, candidates ranked (remembered per project)" })
   vim.api.nvim_create_user_command("ImportForget", function(a)
     local file = vim.api.nvim_buf_get_name(0)
-    local root = file ~= "" and cm.root(file) or nil
+    local root = root_of(file)
     if not root then
       return notify("not in a cargo workspace", vim.log.levels.WARN)
     end
