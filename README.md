@@ -50,6 +50,16 @@ The auto-import autocommands start with `setup()`, so load the plugin with `ft =
 }
 ```
 
+| option | default | meaning |
+| --- | --- | --- |
+| `commands` | `true` | define `:ImportName`, `:ImportForget`, `:ImportOrganize` |
+| `keymaps` | `false` | `true` or a table of the keys you want |
+| `mode` | `"ask"` | `"ask"`, `"single"` or `"off"` |
+| `config.<key>` | see below | engine tuning (positive numbers) |
+| `weights.<key>` | see below | ranking weights (finite numbers) |
+
+Highlights: choices are shown with `vim.ui.select` and a one-key prompt; this plugin draws no window or highlight of its own, so there are no `XynoImports*` groups and everything follows your UI plugin and colorscheme.
+
 No global keymap is set by default. `keymaps = true` maps `<leader>rI` (import name) and `<leader>rO` (organize), buffer-local in Rust files; a table maps only what you list, to the keys you choose.
 
 `mode` decides what happens to a name that resolves to nothing, after `InsertLeave`, a save or a paste:
