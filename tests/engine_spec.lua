@@ -672,9 +672,18 @@ end
 
 --- Replace the buffer and wait until rust-analyzer offers `title` at (row, col).
 local function set_and_wait(buf, lines, row, col, ec, title)
+  -- a cold rust-analyzer (macOS CI runners: cargo metadata + sysroot + indexing) can need minutes before it
+  -- offers any import; wait for it to report itself quiescent before judging the action
+  vim.wait(240000, function()
+    return H.ra_status.quiescent == true
+  end, 200)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   local hits = ca.wait_for(buf, { start = { row, col }, ["end"] = { row, ec } }, { kind = "quickfix", title = title }, { timeout = 120000, only = { "quickfix" } })
-  H.ok(#hits > 0, "rust-analyzer offered " .. title)
+  if #hits == 0 and H.ra_status.quiescent ~= true then
+    skip(("rust-analyzer had not finished loading after the wait (health=%s, quiescent=%s, %s): not a verdict on the import engine"):format(
+      tostring(H.ra_status.health), tostring(H.ra_status.quiescent), tostring(H.ra_status.message)))
+  end
+  H.ok(#hits > 0, "rust-analyzer offered " .. title .. " although it is quiescent (status: " .. vim.inspect(H.ra_status) .. ")")
   -- headless nvim has no keystrokes between the setup and the action: close the undo block
   vim.api.nvim_buf_call(buf, function()
     vim.cmd("let &undolevels = &undolevels")
