@@ -55,7 +55,9 @@ function M.mask(text)
       local raw = false
       if hashes then
         local before = pre:sub(1, #pre - #hashes - 1)
-        raw = not before:match("[%w_]$") or (before:match("[bc]$") and not before:sub(1, -2):match("[%w_]$")) and true or false
+        raw = not before:match("[%w_]$")
+          or (before:match("[bc]$") and not before:sub(1, -2):match("[%w_]$")) and true
+          or false
       end
       local j
       if raw then
@@ -81,8 +83,7 @@ function M.mask(text)
       out[#out + 1] = '"' .. blank(text:sub(s + 1, j - 1))
       i = j
     else -- a quote: char literal or lifetime
-      local e = text:match("^'\\[^\n']*'()", s)
-        or text:match("^'[%z\1-\127\194-\244][\128-\191]*'()", s)
+      local e = text:match("^'\\[^\n']*'()", s) or text:match("^'[%z\1-\127\194-\244][\128-\191]*'()", s)
       if e then
         out[#out + 1] = blank(text:sub(s, e - 1))
         i = e

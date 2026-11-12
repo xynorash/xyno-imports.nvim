@@ -156,7 +156,17 @@ do
 end
 
 -- derive macros the prelude brings in
-local PRELUDE_DERIVES = { Debug = true, Clone = true, Copy = true, PartialEq = true, Eq = true, PartialOrd = true, Ord = true, Hash = true, Default = true }
+local PRELUDE_DERIVES = {
+  Debug = true,
+  Clone = true,
+  Copy = true,
+  PartialEq = true,
+  Eq = true,
+  PartialOrd = true,
+  Ord = true,
+  Hash = true,
+  Default = true,
+}
 
 local DECL = { "struct", "enum", "trait", "type", "union", "mod", "fn", "const", "static" }
 
@@ -280,12 +290,17 @@ function M.scan_syntax(buf, from, to, opts)
       ok = not name:match("^%u%d?$")
     elseif ok and cap == "head" then
       if name:match("^%l") then
-        ok = opts.meta ~= nil and croot ~= nil and cm.is_known_path_head(croot, name, { meta = opts.meta, file = file }) == nil
+        ok = opts.meta ~= nil
+          and croot ~= nil
+          and cm.is_known_path_head(croot, name, { meta = opts.meta, file = file }) == nil
       end
     elseif ok and cap == "derive" then
       local prev, nxt = node:prev_sibling(), node:next_sibling()
       local attr = node:parent():parent():child(0)
-      ok = attr and node_text(attr, buf) == "derive" and not (prev and prev:type() == "::") and not (nxt and nxt:type() == "::")
+      ok = attr
+        and node_text(attr, buf) == "derive"
+        and not (prev and prev:type() == "::")
+        and not (nxt and nxt:type() == "::")
       ok = ok and name:match("^%u") ~= nil and not PRELUDE_DERIVES[name]
     elseif cap == "attr" then
       ok = false
@@ -577,7 +592,14 @@ function M.import_path(a)
   -- shape: a quickfix whose edit adds exactly one `use`; the title only names the path
   if a.kind and tostring(a.kind):match("^quickfix") and ticked then
     local ps = edit_use_paths(a.edit)
-    if #ps == 1 and (ps[1] == ticked or ps[1]:match("::" .. ticked:gsub("%p", "%%%0") .. "$") or ticked:match("::" .. ps[1]:gsub("%p", "%%%0") .. "$")) then
+    if
+      #ps == 1
+      and (
+        ps[1] == ticked
+        or ps[1]:match("::" .. ticked:gsub("%p", "%%%0") .. "$")
+        or ticked:match("::" .. ps[1]:gsub("%p", "%%%0") .. "$")
+      )
+    then
       return ticked
     end
   end
@@ -673,7 +695,8 @@ function M.resolve(name, ctx)
     if ctx.sources == false then
       return rank_and_report(cands)
     end
-    local sctx = vim.tbl_extend("force", ctx, { bufnr = buf, root = root, pos = pos, local_candidates = vim.list_slice(cands) })
+    local sctx =
+      vim.tbl_extend("force", ctx, { bufnr = buf, root = root, pos = pos, local_candidates = vim.list_slice(cands) })
     vim.list_extend(cands, extra_candidates(name, sctx, have))
     extra_candidates_async(name, sctx, have, function(more)
       vim.list_extend(cands, more)
@@ -848,7 +871,11 @@ function M.run(buf, from, to, opts)
         end
         local rem = root and M.remembered(root, p.name)
         local d = M.decide(mode, cands, rem)
-        if d.act == "none" or d.act == "pick" or (d.cand and (dismissed[dkey(root, p.name, d.cand.path)] or dismissed[dkey(root, p.name, "*")])) then
+        if
+          d.act == "none"
+          or d.act == "pick"
+          or (d.cand and (dismissed[dkey(root, p.name, d.cand.path)] or dismissed[dkey(root, p.name, "*")]))
+        then
           return nextp()
         end
         local function apply()
@@ -917,7 +944,12 @@ function M.format_item(c)
   if c.note then
     tag = tag .. "  " .. c.note
   end
-  return ("%s  [%g]%s  %s"):format(c.path, math.floor(c.score * 10 + 0.5) / 10, tag, #c.why > 0 and table.concat(c.why, "; ") or "no signals")
+  return ("%s  [%g]%s  %s"):format(
+    c.path,
+    math.floor(c.score * 10 + 0.5) / 10,
+    tag,
+    #c.why > 0 and table.concat(c.why, "; ") or "no signals"
+  )
 end
 
 M.select = function(...)
@@ -991,7 +1023,12 @@ end
 -- measured on rust-analyzer 1.99 ("Merge imports" and "Normalize import" are refactor.rewrite,
 -- offered at a cursor inside a `use`, not for a selection of it; "Remove unnecessary braces"
 -- and "Remove all unused imports" are quickfixes).
-local ORGANIZE_IDS = { merge_imports = true, normalize_import = true, remove_unused_imports = true, unnecessary_braces_in_use_statement = true }
+local ORGANIZE_IDS = {
+  merge_imports = true,
+  normalize_import = true,
+  remove_unused_imports = true,
+  unnecessary_braces_in_use_statement = true,
+}
 local ORGANIZE = { "^Merge imports", "^Normalize import", "^Remove unnecessary braces", "^Remove all unused imports" }
 
 local function organize_match(a)
@@ -1054,7 +1091,14 @@ function M.organize(buf, cb)
       return
     end
     finished = true
-    notify(msg or (applied > 0 and ("organized imports (%d change%s)"):format(applied, applied == 1 and "" or "s") or "imports already organized"), level)
+    notify(
+      msg
+        or (
+          applied > 0 and ("organized imports (%d change%s)"):format(applied, applied == 1 and "" or "s")
+          or "imports already organized"
+        ),
+      level
+    )
     cb(applied)
   end
   local max_tries = math.max(1, math.ceil(8000 / math.max(M.config.retry_ms, 1)))
@@ -1066,14 +1110,19 @@ function M.organize(buf, cb)
       return finish("buffer is gone", vim.log.levels.WARN)
     end
     local only = { "quickfix", "refactor.rewrite", "source.organizeImports" }
-    ca.request(buf, r, { diagnostics = vim.diagnostic.get(buf, { lnum = r.start[1] }), only = only }, function(list, errs)
-      if busy(errs) and tries < max_tries then
-        return vim.defer_fn(function()
-          ask(r, tries + 1, k)
-        end, M.config.retry_ms)
+    ca.request(
+      buf,
+      r,
+      { diagnostics = vim.diagnostic.get(buf, { lnum = r.start[1] }), only = only },
+      function(list, errs)
+        if busy(errs) and tries < max_tries then
+          return vim.defer_fn(function()
+            ask(r, tries + 1, k)
+          end, M.config.retry_ms)
+        end
+        k(list or {})
       end
-      k(list or {})
-    end)
+    )
   end
 
   function round()
@@ -1158,7 +1207,10 @@ local function track(buf)
 end
 
 local function eligible(buf)
-  return vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].filetype == "rust" and vim.bo[buf].buftype == "" and M.mode() ~= "off"
+  return vim.api.nvim_buf_is_valid(buf)
+    and vim.bo[buf].filetype == "rust"
+    and vim.bo[buf].buftype == ""
+    and M.mode() ~= "off"
 end
 
 --- Scan the rows changed since the last scan, after the debounce.

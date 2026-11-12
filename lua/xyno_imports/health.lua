@@ -47,7 +47,9 @@ function M.check()
   end
   table.sort(changed)
   h.info(#changed > 0 and ("custom weights: " .. table.concat(changed, ", ")) or "ranking weights: defaults")
-  h.info("action detection: assist id (data.id), then edit shape, then English title; organize and resolve are asynchronous")
+  h.info(
+    "action detection: assist id (data.id), then edit shape, then English title; organize and resolve are asynchronous"
+  )
   local state = E.state_file or (vim.fn.stdpath("state") .. "/xyno-imports/imports.json")
   h.info("remembered choices: " .. state)
 end

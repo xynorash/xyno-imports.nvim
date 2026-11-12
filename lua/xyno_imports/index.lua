@@ -58,8 +58,19 @@ function M.use_index(root, cb)
     end)
   end
   local argv = {
-    "rg", "--json", "-U", "--max-filesize", "1M", "-g", "*.rs", "-g", "!target", "-e",
-    "^[ \\t]*(pub(\\([^)]*\\))?[ \\t]+)?use[ \\t][^;]*;", "--", root,
+    "rg",
+    "--json",
+    "-U",
+    "--max-filesize",
+    "1M",
+    "-g",
+    "*.rs",
+    "-g",
+    "!target",
+    "-e",
+    "^[ \\t]*(pub(\\([^)]*\\))?[ \\t]+)?use[ \\t][^;]*;",
+    "--",
+    root,
   }
   local ok = pcall(vim.system, argv, { text = true, timeout = 20000 }, function(r)
     vim.schedule(function()

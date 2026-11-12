@@ -75,7 +75,11 @@ describe("setup", function()
       package.loaded[k] = nil
     end
     local rtp, loaders = vim.o.runtimepath, package.loaders
-    package.loaders = { function() return nil end }
+    package.loaders = {
+      function()
+        return nil
+      end,
+    }
     vim.o.runtimepath = ""
     local ok, err = pcall(I.setup, {})
     vim.o.runtimepath = rtp

@@ -26,7 +26,12 @@ local function load_memory()
           memory[root] = {}
           for name, path in pairs(names) do
             -- from a file: only plain identifiers and paths are ever used
-            if type(name) == "string" and name:match("^[%w_]+$") and type(path) == "string" and path:match("^[%w_]+[%w_:]*$") then
+            if
+              type(name) == "string"
+              and name:match("^[%w_]+$")
+              and type(path) == "string"
+              and path:match("^[%w_]+[%w_:]*$")
+            then
               memory[root][name] = path
             end
           end
