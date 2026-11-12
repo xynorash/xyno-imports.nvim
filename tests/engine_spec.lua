@@ -80,6 +80,65 @@ describe("use paths and titles", function()
     H.eq({ "a::b", "c::d", "c::e" }, vim.fn.sort(E.use_paths(text)))
   end)
 
+  it("finds use items wherever an item may start, and never inside strings or comments", function()
+    local text = table.concat({
+      'mod m { use a::b; pub(crate) use c::d; }',
+      '#[cfg(test)] use e::f;',
+      'pub(in crate::x) use g::h;',
+      'const S: &str = "use no::pe;"; // use no::pe2;',
+      'const R: &str = r#"',
+      'use no::pe3;',
+      '"#;',
+      '/* outer /* nested use no::pe4; */ still comment use no::pe5; */',
+      "fn f<'a>(x: &'a str) { let c = ';'; let url = \"http://x\"; }",
+      "fn g() -> impl Sized + use<'static> { }",
+      'use r#as::{r#fn, self as z};',
+      'use ::std::{',
+      '    self,',
+      '    io::{self as io2, Read as _, prelude::*},',
+      '    collections::{HashMap,',
+      '        hash_map::{self, Entry}},',
+      '};',
+      'fn tail() { let reuse = 1; let use_it = 2; }',
+    }, "\n")
+    H.eq({
+      "a::b", "c::d", "e::f", "g::h", "r#as::r#fn", "r#as",
+      "std", "std::io", "std::io::Read", "std::io::prelude::*",
+      "std::collections::HashMap", "std::collections::hash_map", "std::collections::hash_map::Entry",
+    }, E.use_paths(text))
+  end)
+
+  it("use bindings of nested groups and `self`", function()
+    local binds = {}
+    for _, b in ipairs(E.use_binding_list("use a::{self, b::{self as c, d}, e::{self}};\nuse f::g as _;")) do
+      binds[#binds + 1] = (b.name or "-") .. "=" .. b.path
+    end
+    H.eq({ "a=a", "c=a::b", "d=a::b::d", "e=a::e", "_=f::g" }, binds)
+  end)
+
+  it("keeps a multi-line tree in one statement and an unterminated one out", function()
+    local sts = E.use_statements("use a::{\n  b,\n  c,\n};\nuse broken::tree\nfn f() {}\n")
+    H.eq(1, #sts)
+    H.eq(1, sts[1].first)
+    H.eq({ "a::b", "a::c" }, E.flatten_use(sts[1].text))
+  end)
+
+  it("the first use of a name skips multi-line use trees, comments and strings", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "use a::{",
+      "    HashMap,",
+      "};",
+      '// HashMap in a comment, "HashMap" in a string',
+      'const S: &str = "HashMap";',
+      "fn f() { let m: HashMap<u8, u8> = HashMap::new(); }",
+    })
+    local r = E.word_range(buf, "HashMap")
+    H.eq({ row = 5, col = 16, end_col = 23 }, r)
+    H.eq(nil, E.word_range(buf, "Nope"))
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end)
+
   it("reads the import title and refuses anything odd", function()
     H.eq("std::io::Error", E.parse_title("Import `std::io::Error`"))
     H.eq("std::fmt::Write", E.parse_title("Import `std::fmt::Write as _`"))

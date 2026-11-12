@@ -80,6 +80,9 @@ Several candidates are never guessed at: use `:ImportName`. `vim.g.xyno_auto_imp
 
 ## How it works
 
+`use` statements are read by a small scanner, not by line patterns: comments (block comments nest), strings, raw strings and char literals are masked first, then every `use` that starts an item is found (after `{`, `;`, an attribute or a visibility, on its own line or not; never inside a string, a comment, `r#use` or `impl Trait + use<'a>`), and the tree is parsed token by token. Multi-line trees, nested groups, `self`, `self as x`, `as _`, raw identifiers and leading `::` are handled (`tests/engine_spec.lua`). A `use` without its `;` is ignored. The "first use of the name" in the buffer skips use trees (every line of them), comments and strings.
+
+
 After `InsertLeave`, a save or a paste, the changed lines are scanned for names that resolve to nothing (diagnostics of rust-analyzer and the clippy tier, plus a tree-sitter scan), debounced. rust-analyzer is asked for the code actions at each one. Candidates are scored by what the project already does (the same `use` in this file, in sibling modules and in the crate), the context of the name (derive, error type, return type, trait position), the order of the dependencies, and a penalty for a crate that is not a dependency yet; the reasons are shown in the picker. The choices you make are stored per workspace root in `stdpath("state")/xyno-imports/imports.json`. An undo of an import is noticed, so the name does not come back by itself.
 
 ## Language of the language server

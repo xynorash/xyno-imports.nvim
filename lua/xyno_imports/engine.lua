@@ -177,8 +177,99 @@ end
 
 -- --------------------------------------------------------------- use paths
 
+local function blank(piece)
+  return (piece:gsub("[^\n]", " "))
+end
+
+--- The text with comments (block comments nest), string and raw string contents and char
+--- literals replaced by spaces; same length, newlines kept, so offsets stay valid. A lifetime
+--- (`'a`) is not a char literal. Nothing that is left can hide a `;`, a brace or the word `use`
+--- inside a string or a comment, which is what a pattern over the raw text got wrong.
+function M.mask(text)
+  local out, i, n = {}, 1, #text
+  while i <= n do
+    local s = text:find("[/\"']", i)
+    if not s then
+      out[#out + 1] = text:sub(i)
+      break
+    end
+    out[#out + 1] = text:sub(i, s - 1)
+    local c, nx = text:sub(s, s), text:sub(s + 1, s + 1)
+    if c == "/" and nx == "/" then
+      local e = text:find("\n", s, true) or (n + 1)
+      out[#out + 1] = blank(text:sub(s, e - 1))
+      i = e
+    elseif c == "/" and nx == "*" then
+      local depth, j = 1, s + 2
+      while depth > 0 do
+        local a = text:find("[/*]", j)
+        if not a then
+          j = n + 1
+          break
+        end
+        local pair = text:sub(a, a + 1)
+        if pair == "/*" then
+          depth, j = depth + 1, a + 2
+        elseif pair == "*/" then
+          depth, j = depth - 1, a + 2
+        else
+          j = a + 1
+        end
+      end
+      out[#out + 1] = blank(text:sub(s, j - 1))
+      i = j
+    elseif c == "/" then
+      out[#out + 1] = "/"
+      i = s + 1
+    elseif c == '"' then
+      -- raw string: r"..." / r#"..."# / br#"..."# (the prefix was copied above)
+      local pre = text:sub(math.max(1, s - 40), s - 1)
+      local hashes = pre:match("r(#*)$")
+      local raw = false
+      if hashes then
+        local before = pre:sub(1, #pre - #hashes - 1)
+        raw = not before:match("[%w_]$") or (before:match("[bc]$") and not before:sub(1, -2):match("[%w_]$")) and true or false
+      end
+      local j
+      if raw then
+        local close = '"' .. hashes
+        local e = select(2, text:find(close, s + 1, true))
+        j = (e or n) + 1
+      else
+        j = s + 1
+        while j <= n do
+          local a = text:find('[\\"]', j)
+          if not a then
+            j = n + 1
+            break
+          end
+          if text:sub(a, a) == "\\" then
+            j = a + 2
+          else
+            j = a + 1
+            break
+          end
+        end
+      end
+      out[#out + 1] = '"' .. blank(text:sub(s + 1, j - 1))
+      i = j
+    else -- a quote: char literal or lifetime
+      local e = text:match("^'\\[^\n']*'()", s)
+        or text:match("^'[%z\1-\127\194-\244][\128-\191]*'()", s)
+      if e then
+        out[#out + 1] = blank(text:sub(s, e - 1))
+        i = e
+      else
+        out[#out + 1] = "'"
+        i = s + 1
+      end
+    end
+  end
+  return table.concat(out)
+end
+
 local function strip_comments(text)
-  return (text:gsub("/%*.-%*/", " "):gsub("//[^\n]*", ""))
+  return M.mask(text)
 end
 
 local function join(prefix, segs)
@@ -297,16 +388,85 @@ function M.use_bindings(stmt)
   return binds
 end
 
-local USE_PATTERNS = { "\n[ \t]*(use%s+[^;]*;)", "\n[ \t]*(pub%s+use%s+[^;]*;)", "\n[ \t]*(pub%s*%b()%s*use%s+[^;]*;)" }
+--- Whether the `use` keyword at byte `s` of the masked text starts an item: the last thing before
+--- it (a visibility `pub` or `pub(...)` skipped) is the start of the text, `;`, `{`, `}` or `]`
+--- (the end of an attribute). `impl Trait + use<'a>` and `r#use` are not.
+local function item_start(m, s)
+  local p = s - 1
+  local function is_pub(q)
+    return m:sub(q - 2, q) == "pub" and not m:sub(q - 3, q - 3):match("[%w_]")
+  end
+  local function skip_ws()
+    while p >= 1 and m:sub(p, p):match("%s") do
+      p = p - 1
+    end
+  end
+  skip_ws()
+  if m:sub(p, p) == ")" then
+    local depth = 0
+    while p >= 1 do
+      local ch = m:sub(p, p)
+      if ch == ")" then
+        depth = depth + 1
+      elseif ch == "(" then
+        depth = depth - 1
+        if depth == 0 then
+          break
+        end
+      end
+      p = p - 1
+    end
+    p = p - 1
+    skip_ws()
+    if not is_pub(p) then
+      return false
+    end
+    p = p - 3
+    skip_ws()
+  elseif is_pub(p) then
+    p = p - 3
+    skip_ws()
+  end
+  if p < 1 then
+    return true
+  end
+  local ch = m:sub(p, p)
+  return ch == ";" or ch == "{" or ch == "}" or ch == "]"
+end
+
+--- The `use` items of a source text, found on the masked text (see M.mask), so the keyword is
+--- found wherever an item may start (after `{`, `;`, an attribute on the same line, ...) and never
+--- inside a string or a comment. Each: { text = "use a::{b, c};", first = byte, last = byte }.
+---@return { text: string, first: integer, last: integer }[]
+function M.use_statements(text)
+  local out = {}
+  if not text:find("use", 1, true) then
+    return out
+  end
+  local m = M.mask(text)
+  local i = 1
+  while true do
+    local s = m:find("%f[%w_]use%f[^%w_]", i)
+    if not s then
+      break
+    end
+    i = s + 3
+    if m:sub(s - 2, s - 1) ~= "r#" and item_start(m, s) then
+      local e = m:find(";", s, true)
+      if e then
+        out[#out + 1] = { text = m:sub(s, e), first = s, last = e }
+        i = e + 1
+      end
+    end
+  end
+  return out
+end
 
 --- All paths imported by the `use` statements of a text.
 function M.use_paths(text)
   local out = {}
-  local t = "\n" .. strip_comments(text)
-  for _, pat in ipairs(USE_PATTERNS) do
-    for stmt in t:gmatch(pat) do
-      vim.list_extend(out, M.flatten_use(stmt))
-    end
+  for _, st in ipairs(M.use_statements(text)) do
+    vim.list_extend(out, M.flatten_use(st.text))
   end
   return out
 end
@@ -314,11 +474,8 @@ end
 --- All bindings introduced by the `use` statements of a text (see use_bindings).
 function M.use_binding_list(text)
   local out = {}
-  local t = "\n" .. strip_comments(text)
-  for _, pat in ipairs(USE_PATTERNS) do
-    for stmt in t:gmatch(pat) do
-      vim.list_extend(out, M.use_bindings(stmt))
-    end
+  for _, st in ipairs(M.use_statements(text)) do
+    vim.list_extend(out, M.use_bindings(st.text))
   end
   return out
 end
@@ -1116,9 +1273,7 @@ local function edit_use_paths(edit)
   local function scan(edits)
     for _, e in ipairs(edits or {}) do
       if type(e.newText) == "string" then
-        for stmt in ("\n" .. e.newText):gmatch("\n[ \t]*(use%s+[^;]*;)") do
-          vim.list_extend(out, M.flatten_use(stmt))
-        end
+        vim.list_extend(out, M.use_paths(e.newText))
       end
     end
   end
@@ -1198,24 +1353,30 @@ function M.candidates_at(buf, pos, cb, diags, tries)
 end
 
 local function word_range(buf, name)
-  -- the first use of `name` as a whole word outside of `use` lines
-  for i, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
-    if not l:match("^%s*use%s") and not l:match("^%s*pub%s.*use%s") then
-      local s = 1
-      while true do
-        local a, b = l:find(name, s, true)
-        if not a then
-          break
-        end
-        local before, after = l:sub(a - 1, a - 1), l:sub(b + 1, b + 1)
-        if not before:match("[%w_]") and not after:match("[%w_]") then
-          return { row = i - 1, col = a - 1, end_col = b }
-        end
-        s = b + 1
-      end
+  -- the first use of `name` as a whole word outside of `use` items (a multi-line tree included),
+  -- comments and strings
+  local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+  local m = M.mask(text)
+  for _, st in ipairs(M.use_statements(text)) do
+    m = m:sub(1, st.first - 1) .. (m:sub(st.first, st.last):gsub("[^\n]", " ")) .. m:sub(st.last + 1)
+  end
+  local s = 1
+  while true do
+    local a, b = m:find(name, s, true)
+    if not a then
+      return nil
     end
+    local before, after = m:sub(a - 1, a - 1), m:sub(b + 1, b + 1)
+    if not before:match("[%w_]") and not after:match("[%w_]") then
+      local row = select(2, m:sub(1, a - 1):gsub("\n", "")) -- newlines before it
+      local line_start = (m:sub(1, a - 1):match(".*\n()") or 1)
+      return { row = row, col = a - line_start, end_col = b - line_start + 1 }
+    end
+    s = b + 1
   end
 end
+
+M.word_range = word_range
 
 --- Ranked candidates of `name`, for other modules (the derive acceptance of
 --- macro-attrs, the crate-adding stage).
