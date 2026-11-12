@@ -192,6 +192,14 @@ function H.capture_notify()
   vim.notify = function(msg, level)
     cap.list[#cap.list + 1] = { msg = msg, level = level }
   end
+  --- The messages only, in order. Asserting on the LAST one is fragile in a session with other language
+  --- servers: a late window/showMessage (e.g. bacon-ls "building live diagnostics shadow workspace", seen on
+  --- the macOS runner) lands after the note under test.
+  cap.msgs = function()
+    return vim.tbl_map(function(c)
+      return c.msg
+    end, cap.list)
+  end
   cap.restore = function()
     vim.notify = orig
   end
