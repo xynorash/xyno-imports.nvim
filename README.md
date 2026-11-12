@@ -95,6 +95,10 @@ Several candidates are never guessed at: use `:ImportName`. `vim.g.xyno_auto_imp
 
 After `InsertLeave`, a save or a paste, the changed lines are scanned for names that resolve to nothing (diagnostics of rust-analyzer and the clippy tier, plus a tree-sitter scan), debounced. rust-analyzer is asked for the code actions at each one. Candidates are scored by what the project already does (the same `use` in this file, in sibling modules and in the crate), the context of the name (derive, error type, return type, trait position), the order of the dependencies, and a penalty for a crate that is not a dependency yet; the reasons are shown in the picker. The choices you make are stored per workspace root in `stdpath("state")/xyno-imports/imports.json`. An undo of an import is noticed, so the name does not come back by itself.
 
+## Layout
+
+`lua/xyno_imports/engine.lua` is the facade and holds the stateful rest (tree-sitter facts, the language server round trips, applying, the commands and triggers). Parts: `uses.lua` (reading `use` items), `memory.lua` (the per-project choices), `rank.lua` (candidates, weights, scoring) and `index.lua` (the project's use index). `require("xyno_imports.engine")` exposes the same functions as before.
+
 ## Language of the language server
 
 Import actions are recognised by rust-analyzer's assist id (`data.id`, `auto_import`), then by the shape of the action (a quickfix whose edit adds a `use`), then by the English title `Import \`a::B\``; the path is read from the backticked part of the title or from the edit. Organize assists are recognised by id (`merge_imports`, `normalize_import`, `remove_unused_imports`), by the kind `source.organizeImports`, then by their English titles. Limits: rust-analyzer's own messages are English only as far as I know, so the non-English path is covered by specs with a fake server, not by a localised rust-analyzer; "Remove unnecessary braces" is a diagnostic quickfix without an id, so it is matched by its English title only. An import action whose title has no backticked path and whose edit is lazy (resolved only on apply) is not offered.
