@@ -77,6 +77,16 @@ Several candidates are never guessed at: use |:ImportName|.
                           above this
   source_wait_ms   4000   how long `resolve()` waits for asynchronous sources
 
+All values must be positive numbers; an unknown key or a bad value is refused
+with one warning.
+
+                                                       *xyno-imports-weights*
+`weights` overrides ranking numbers (defaults in `engine.default_weights`):
+file 4, sibling 3, crate 2, near 0.5 (within [0,1]), cap 5 (positive integer),
+derive_macro 10, derive_std -4, error_type 5, return_type 8, trait_pos 5,
+shadowed_std -3, std_twin -2, dependency 1, not_dependency -5. An unknown name
+or a non-finite value refuses the whole table (one warning, defaults stay).
+
 ==============================================================================
 4. COMMANDS                                                    *xyno-imports-commands*
 
@@ -115,9 +125,15 @@ one): `{ import = "<leader>ci", organize = false }`.
 mode()                      "ask", "single" or "off"
 resolve({name}, {ctx})      ranked candidates of a name:
                             `{ name, candidates, best, remembered, choice,
-                            unambiguous, root }`; with `ctx.cb` it is async
+                            unambiguous, root }`; asynchronous, needs `ctx.cb` (a call
+                            without it returns nil and a message)
 import_name({name}?)        the |:ImportName| flow
-organize()                  the |:ImportOrganize| flow
+organize({buf}?, {cb}?)     the |:ImportOrganize| flow; asynchronous,
+                            `cb(applied)`
+import_path({action})       the path an import code action brings (assist id,
+                            edit shape, English title), or nil
+use_bindings({stmt})        names a `use` binds (aliases)
+set_weights({t})            validate and apply weights
 trigger({buf})              scan the changed lines of a buffer now
 score({cand}, {facts})      score and reasons of one candidate
 rank({cands}, {facts})      candidates sorted best first

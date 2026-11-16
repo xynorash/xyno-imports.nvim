@@ -192,6 +192,14 @@ function H.capture_notify()
   vim.notify = function(msg, level)
     cap.list[#cap.list + 1] = { msg = msg, level = level }
   end
+  --- The messages only, in order. Asserting on the LAST one is fragile in a session with other language
+  --- servers: a late window/showMessage (e.g. bacon-ls "building live diagnostics shadow workspace", seen on
+  --- the macOS runner) lands after the note under test.
+  cap.msgs = function()
+    return vim.tbl_map(function(c)
+      return c.msg
+    end, cap.list)
+  end
   cap.restore = function()
     vim.notify = orig
   end
@@ -201,13 +209,26 @@ end
 
 --- Start a real rust-analyzer for `buf` rooted at `root` (what rustaceanvim or
 --- nvim-lspconfig would do in a full setup). Returns the client.
+--- Last `experimental/serverStatus` of the rust-analyzer started by start_ra: { health, quiescent, message }.
+--- quiescent == true means it has finished loading the workspace and indexing (nil: not heard yet).
+H.ra_status = {}
+
 function H.start_ra(buf, root, cargo)
   H.need_rust()
+  H.ra_status = {}
   local id = vim.lsp.start({
     name = "rust-analyzer",
     cmd = { "rust-analyzer" },
     root_dir = root,
     settings = { ["rust-analyzer"] = { cargo = cargo or { allFeatures = true, targetDir = true } } },
+    capabilities = vim.tbl_deep_extend("force", vim.lsp.protocol.make_client_capabilities(), {
+      experimental = { serverStatusNotification = true },
+    }),
+    handlers = {
+      ["experimental/serverStatus"] = function(_, result)
+        H.ra_status = result or {}
+      end,
+    },
   }, { bufnr = buf })
   return H.wait_for(function()
     local c = id and vim.lsp.get_client_by_id(id)

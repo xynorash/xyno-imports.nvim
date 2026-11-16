@@ -3,7 +3,9 @@
 -- missing-dependency message is one line, and a name in a scratch crate is resolved.
 local failures = {}
 local function check(name, ok, detail)
-  io.stdout:write(("%s %s%s\n"):format(ok and "ok  " or "FAIL", name, (not ok and detail) and (": " .. tostring(detail)) or ""))
+  io.stdout:write(
+    ("%s %s%s\n"):format(ok and "ok  " or "FAIL", name, (not ok and detail) and (": " .. tostring(detail)) or "")
+  )
   if not ok then
     failures[#failures + 1] = name
   end
@@ -20,9 +22,17 @@ for _, m in ipairs({ "engine" }) do
 end
 check("mode() default", require("xyno_imports.engine").mode() == "ask")
 
-local repo = vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"))))
+local repo =
+  vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"))))
 vim.cmd("helptags " .. vim.fn.fnameescape(repo .. "/doc"))
-for _, tag in ipairs({ "xyno-imports", "xyno-imports-api", "xyno-imports-setup", ":ImportName", ":ImportForget", ":ImportOrganize" }) do
+for _, tag in ipairs({
+  "xyno-imports",
+  "xyno-imports-api",
+  "xyno-imports-setup",
+  ":ImportName",
+  ":ImportForget",
+  ":ImportOrganize",
+}) do
   local ok, err = pcall(vim.cmd, "help " .. tag)
   check(":help " .. tag, ok, err)
 end
@@ -46,7 +56,11 @@ for _, k in ipairs({ "xyno_rust.crate_meta", "xyno_rust.code_actions", "xyno_rus
 end
 local saved_path = package.path
 local saved_loaders = package.loaders
-package.loaders = { function() return nil end }
+package.loaders = {
+  function()
+    return nil
+  end,
+}
 package.path = ""
 local rtp = vim.o.runtimepath
 vim.o.runtimepath = ""

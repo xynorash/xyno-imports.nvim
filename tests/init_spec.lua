@@ -75,7 +75,11 @@ describe("setup", function()
       package.loaded[k] = nil
     end
     local rtp, loaders = vim.o.runtimepath, package.loaders
-    package.loaders = { function() return nil end }
+    package.loaders = {
+      function()
+        return nil
+      end,
+    }
     vim.o.runtimepath = ""
     local ok, err = pcall(I.setup, {})
     vim.o.runtimepath = rtp
@@ -90,5 +94,44 @@ describe("setup", function()
     H.not_ok(notes.list[1].msg:find("\n"))
     H.eq(vim.log.levels.ERROR, notes.list[1].level)
     H.eq(0, vim.fn.exists(":ImportName"))
+  end)
+end)
+
+describe("xyno-rust.nvim API pin", function()
+  local rust = require("xyno_rust")
+  local saved = rust.api_version
+  after_each(function()
+    rust.api_version = saved
+  end)
+
+  local function setup_with(version)
+    rust.api_version = version
+    local notes, orig = {}, vim.notify
+    vim.notify = function(msg, level)
+      notes[#notes + 1] = { msg = msg, level = level }
+    end
+    local ok, err = pcall(require("xyno_imports").setup, {})
+    vim.notify = orig
+    H.ok(ok, tostring(err))
+    return notes
+  end
+
+  it("states the API it needs and accepts it", function()
+    local want = require("xyno_imports").requires_rust_api
+    H.match(want, "^%d+%.%d+$")
+    H.eq(true, (rust.compatible(want)))
+  end)
+
+  it("a newer major of xyno-rust.nvim: one clear error line, nothing started", function()
+    local notes = setup_with("2.0")
+    H.eq(1, #notes)
+    H.match(notes[1].msg, "xyno-imports: xyno-rust api 2.0 is installed", true)
+    H.eq(vim.log.levels.ERROR, notes[1].level)
+  end)
+
+  it("an older minor of xyno-rust.nvim says to update it", function()
+    local notes = setup_with("1.0")
+    H.eq(1, #notes)
+    H.match(notes[1].msg, "update xyno-rust.nvim", true)
   end)
 end)
